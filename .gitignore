@@ -1,0 +1,11 @@
+.env
+node_modules
+dist
+.DS_Store
+.vscode
+.idea
+*.log
+venv
+__pycache__/
+*.pyc
+weaviate_data/

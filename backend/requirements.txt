@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pymupdf
+langchain
+sentence-transformers
+weaviate-client
+google-generativeai
+python-multipart # For file uploads in FastAPI
