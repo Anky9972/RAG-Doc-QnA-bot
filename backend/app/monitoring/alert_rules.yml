@@ -1,0 +1,104 @@
+# monitoring/alert_rules.yml
+groups:
+  - name: pdf-qa-alerts
+    rules:
+      # High error rate
+      - alert: HighErrorRate
+        expr: rate(errors_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate detected"
+          description: "Error rate is {{ $value }} errors per second for component {{ $labels.component }}"
+
+      # High response time
+      - alert: HighResponseTime
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High response time detected"
+          description: "95th percentile response time is {{ $value }}s for endpoint {{ $labels.endpoint }}"
+
+      # Provider unavailable
+      - alert: ProviderUnavailable
+        expr: provider_availability == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LLM Provider unavailable"
+          description: "Provider {{ $labels.provider }} has been unavailable for more than 1 minute"
+
+      # High LLM costs
+      - alert: HighLLMCosts
+        expr: rate(llm_cost_cents_total[1h]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High LLM costs detected"
+          description: "LLM costs are {{ $value }} cents per hour for provider {{ $labels.provider }}"
+
+      # Long LLM response times
+      - alert: LongLLMResponseTime
+        expr: histogram_quantile(0.95, rate(llm_latency_seconds_bucket[5m])) > 10
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Long LLM response time"
+          description: "95th percentile LLM response time is {{ $value }}s for {{ $labels.provider }}/{{ $labels.model }}"
+
+      # Document processing issues
+      - alert: SlowDocumentProcessing
+        expr: histogram_quantile(0.95, rate(document_processing_duration_seconds_bucket[5m])) > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow document processing"
+          description: "Document processing is taking {{ $value }}s (95th percentile)"
+
+      # Vector search performance
+      - alert: SlowVectorSearch
+        expr: histogram_quantile(0.95, rate(vector_search_duration_seconds_bucket[5m])) > 1
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow vector search"
+          description: "Vector search is taking {{ $value }}s (95th percentile)"
+
+      # High memory usage (if you have node_exporter)
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 0.9
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is above 90%"
+
+  - name: ollama-specific
+    rules:
+      # Ollama specific alerts
+      - alert: OllamaConnectionLost
+        expr: provider_availability{provider="ollama"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ollama connection lost"
+          description: "Cannot connect to Ollama service"
+
+      - alert: NoOllamaModels
+        expr: provider_availability{provider="ollama"} == 0 and increase(errors_total{component="ollama"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No Ollama models available"
+          description: "Ollama is running but no models are available"

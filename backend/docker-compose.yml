@@ -1,16 +1,155 @@
+# docker-compose.yml
 version: '3.8'
+
 services:
-  weaviate:
-    image: semitechnologies/weaviate:1.25.0 # Use a recent version
+  app:
+    build: .
     ports:
-      - "8080:8080" # HTTP
-      - "50051:50051" # gRPC
+      - "8000:8000"
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=pdf_qa_system
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+      - WEAVIATE_URL=http://weaviate:8080
+      - OLLAMA_BASE_URL=http://ollama:11434
+    depends_on:
+      - postgres
+      - weaviate
+      - ollama
     volumes:
-      - ./weaviate_data:/var/lib/weaviate
+      - .:/app
+    networks:
+      - pdf_qa_network
+
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: pdf_qa_system
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    networks:
+      - pdf_qa_network
+
+  weaviate:
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - '8080'
+      - --scheme
+      - http
+    image: semitechnologies/weaviate:1.23.7
+    ports:
+      - "8080:8080"
+    volumes:
+      - weaviate_data:/var/lib/weaviate
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
       PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
-      DEFAULT_VECTORIZER_MODULE: 'none' # We'll provide our own vectors
-      ENABLE_MODULES: '' # No specific modules needed if we provide vectors
-    restart: on-failure:0
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      ENABLE_MODULES: 'text2vec-contextionary,text2vec-transformers,generative-openai,generative-cohere,generative-palm,ref2vec-centroid,reranker-transformers,qna-transformers'
+      CLUSTER_HOSTNAME: 'node1'
+    networks:
+      - pdf_qa_network
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_ORIGINS=*
+    networks:
+      - pdf_qa_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - pdf_qa_network
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - pdf_qa_network
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    networks:
+      - pdf_qa_network
+
+volumes:
+  postgres_data:
+  weaviate_data:
+  ollama_data:
+  redis_data:
+  grafana_data:
+  prometheus_data:
+
+networks:
+  pdf_qa_network:
+    driver: bridge
+
+# # Dockerfile
+# FROM python:3.11-slim
+
+# WORKDIR /app
+
+# # Install system dependencies
+# RUN apt-get update && apt-get install -y \
+#     gcc \
+#     g++ \
+#     && rm -rf /var/lib/apt/lists/*
+
+# # Copy requirements first for better caching
+# COPY requirements.txt .
+# RUN pip install --no-cache-dir -r requirements.txt
+
+# # Copy application code
+# COPY . .
+
+# # Create non-root user
+# RUN useradd --create-home --shell /bin/bash app \
+#     && chown -R app:app /app
+# USER app
+
+# # Expose port
+# EXPOSE 8000
+
+# # Health check
+# HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+#     CMD python -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
+
+# # Run application
+# CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
