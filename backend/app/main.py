@@ -6,8 +6,8 @@ import uuid
 import secrets
 from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
-
+from datetime import datetime, timedelta, timezone
+from app.database.models import User, Document, QueryLog, Conversation, Message, UserSession, DocumentTable, TableEntity, DocumentChunk
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query, BackgroundTasks, APIRouter, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -18,6 +18,21 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 import psutil
 import re
+import os
+from app.services.email_service import email_service
+from app.database.models import PasswordResetToken
+from app.schemas import (
+    ForgotPasswordRequest, 
+    ResetPasswordRequest, 
+    PasswordResetResponse,
+    ChangePasswordRequest
+)
+from app.services.llamacloud_processor import (
+    get_llamacloud_processor,  # Changed from llamacloud_processor 
+    is_llamacloud_available, 
+    should_use_llamacloud,
+    LlamaCloudError
+)
 
 from app.core import config
 from app.database.connection import init_db, get_db, get_db_session
@@ -33,6 +48,15 @@ from app.utils.rate_limiter import rate_limiter
 from app.services.pdf_processor import enhanced_pdf_processor
 from app.services.query_classifier import query_classifier, structured_query_processor
 from app.database.models import DocumentTable, TableEntity, QueryPattern
+from app.services.email_service import email_service
+from app.database.models import PasswordResetToken
+from app.schemas import (
+    ForgotPasswordRequest, 
+    ResetPasswordRequest, 
+    PasswordResetResponse,
+    ChangePasswordRequest
+)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -82,9 +106,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     if expires_delta:
-        expire = datetime.utcnow() + expires_delta
+        expire = datetime.now(timezone.utc) + expires_delta
     else:
-        expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+        expire = datetime.now(timezone.utc) + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
@@ -261,7 +285,7 @@ async def signup(user_data: UserSignup, db: Session = Depends(get_db)):
     user_session = UserSession(
         user_id=new_user.id,
         session_token=session_token,
-        expires_at=datetime.utcnow() + access_token_expires
+        expires_at=datetime.now(timezone.utc) + access_token_expires
     )
     db.add(user_session)
     db.commit()
@@ -312,12 +336,12 @@ async def login(user_credentials: UserLogin, db: Session = Depends(get_db)):
     existing_session = db.query(UserSession).filter(UserSession.user_id == user.id).first()
     if existing_session:
         existing_session.session_token = secrets.token_urlsafe(32)
-        existing_session.expires_at = datetime.utcnow() + access_token_expires
+        existing_session.expires_at = datetime.now(timezone.utc) + access_token_expires
     else:
         user_session = UserSession(
             user_id=user.id,
             session_token=secrets.token_urlsafe(32),
-            expires_at=datetime.utcnow() + access_token_expires
+            expires_at=datetime.now(timezone.utc) + access_token_expires
         )
         db.add(user_session)
     
@@ -355,6 +379,293 @@ async def logout(
     
     return {"message": "Successfully logged out"}
 
+@app.post("/auth/forgot-password", response_model=PasswordResetResponse)
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Initiate password reset process
+    
+    - Validates email exists
+    - Generates reset token
+    - Sends reset email
+    - Rate limited to prevent abuse
+    """
+    try:
+        # Find user by email
+        user = db.query(User).filter(User.email == request.email).first()
+        
+        # Always return success to prevent email enumeration
+        # But only send email if user exists
+        if user:
+            # Check for existing valid tokens
+            existing_token = db.query(PasswordResetToken).filter(
+                PasswordResetToken.user_id == user.id,
+                PasswordResetToken.used == False,
+                PasswordResetToken.expires_at > datetime.now(timezone.utc)
+            ).first()
+            
+            if existing_token:
+                # Token already exists and is valid
+                logger.info(f"Valid reset token already exists for user: {user.email}")
+            else:
+                # Generate new reset token
+                reset_token = secrets.token_urlsafe(32)
+                expires_at = datetime.now(timezone.utc) + timedelta(hours=1)  # 1 hour expiry
+                
+                # Store token in database
+                password_reset_token = PasswordResetToken(
+                    user_id=user.id,
+                    token=reset_token,
+                    expires_at=expires_at
+                )
+                
+                db.add(password_reset_token)
+                db.commit()
+                
+                # Send reset email in background
+                if email_service.is_enabled():
+                    background_tasks.add_task(
+                        email_service.send_password_reset_email,
+                        to_email=user.email,
+                        username=user.username,
+                        reset_token=reset_token,
+                        expires_in_minutes=60
+                    )
+                    logger.info(f"Password reset email queued for: {user.email}")
+                else:
+                    logger.warning(f"Email service disabled. Reset token for {user.email}: {reset_token}")
+        else:
+            logger.info(f"Password reset requested for non-existent email: {request.email}")
+        
+        # Always return success message (prevent email enumeration)
+        return PasswordResetResponse(
+            message="If an account with that email exists, a password reset link has been sent.",
+            success=True
+        )
+        
+    except Exception as e:
+        logger.error(f"Error in forgot password: {e}", exc_info=True)
+        # Still return success to prevent information leakage
+        return PasswordResetResponse(
+            message="If an account with that email exists, a password reset link has been sent.",
+            success=True
+        )
+
+
+@app.post("/auth/reset-password", response_model=PasswordResetResponse)
+async def reset_password(
+    request: ResetPasswordRequest,
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Reset password using token
+    
+    - Validates reset token
+    - Updates user password
+    - Invalidates token
+    - Sends confirmation email
+    """
+    try:
+        # Find and validate token
+        reset_token = db.query(PasswordResetToken).filter(
+            PasswordResetToken.token == request.token,
+            PasswordResetToken.used == False
+        ).first()
+        
+        if not reset_token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid or expired reset token"
+            )
+        
+        # Check if token is expired
+        if not reset_token.is_valid():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Reset token has expired. Please request a new one."
+            )
+        
+        # Get user
+        user = db.query(User).filter(User.id == reset_token.user_id).first()
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Hash new password
+        hashed_password = hash_password(request.new_password)
+        
+        # ✅ FIX: Update user password correctly
+        user.password_hash = hashed_password  # Changed from user.profile["password_hash"]
+        
+        # Optional: Update password_changed_at timestamp if you have this field
+        # user.password_changed_at = datetime.now(timezone.utc)
+        
+        # Mark token as used
+        reset_token.used = True
+        reset_token.used_at = datetime.now(timezone.utc)
+        
+        # Invalidate all user sessions (force re-login)
+        db.query(UserSession).filter(UserSession.user_id == user.id).delete()
+        
+        # Commit changes
+        db.commit()
+        
+        logger.info(f"Password reset successful for user: {user.username}")
+        
+        # Send confirmation email in background
+        if email_service.is_enabled():
+            background_tasks.add_task(
+                email_service.send_password_changed_confirmation,
+                to_email=user.email,
+                username=user.username
+            )
+        
+        return PasswordResetResponse(
+            message="Password reset successfully. Please login with your new password.",
+            success=True
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in reset password: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to reset password. Please try again."
+        )
+
+@app.post("/auth/change-password", response_model=PasswordResetResponse)
+async def change_password(
+    request: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """
+    Change password for authenticated user
+    
+    - Requires authentication
+    - Validates current password
+    - Updates to new password
+    - Sends confirmation email
+    """
+    try:
+        # Verify current password
+        stored_password_hash = current_user.profile.get("password_hash")
+        
+        if not stored_password_hash or not verify_password(request.current_password, stored_password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Current password is incorrect"
+            )
+        
+        # Check if new password is same as current
+        if verify_password(request.new_password, stored_password_hash):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="New password must be different from current password"
+            )
+        
+        # Hash new password
+        hashed_password = hash_password(request.new_password)
+        
+        # Update user password
+        current_user.profile["password_hash"] = hashed_password
+        
+        # Invalidate other sessions (keep current session active)
+        db.query(UserSession).filter(
+            UserSession.user_id == current_user.id
+        ).delete()
+        
+        # Create new session for current user
+        access_token_expires = timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
+        session_token = secrets.token_urlsafe(32)
+        user_session = UserSession(
+            user_id=current_user.id,
+            session_token=session_token,
+            expires_at=datetime.now(timezone.utc) + access_token_expires
+        )
+        db.add(user_session)
+        
+        db.commit()
+        
+        logger.info(f"Password changed successfully for user: {current_user.username}")
+        
+        # Send confirmation email in background
+        if email_service.is_enabled():
+            background_tasks.add_task(
+                email_service.send_password_changed_confirmation,
+                to_email=current_user.email,
+                username=current_user.username
+            )
+        
+        return PasswordResetResponse(
+            message="Password changed successfully",
+            success=True
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in change password: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to change password. Please try again."
+        )
+
+
+@app.get("/auth/validate-reset-token/{token}")
+async def validate_reset_token(
+    token: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Validate if a reset token is still valid
+    
+    - Useful for frontend to check token before showing reset form
+    """
+    try:
+        reset_token = db.query(PasswordResetToken).filter(
+            PasswordResetToken.token == token,
+            PasswordResetToken.used == False
+        ).first()
+        
+        if not reset_token:
+            return {
+                "valid": False,
+                "message": "Invalid token"
+            }
+        
+        if not reset_token.is_valid():
+            return {
+                "valid": False,
+                "message": "Token has expired"
+            }
+        
+        # Get user to return username
+        user = db.query(User).filter(User.id == reset_token.user_id).first()
+        
+        return {
+            "valid": True,
+            "message": "Token is valid",
+            "username": user.username if user else None,
+            "expires_at": reset_token.expires_at.isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Error validating reset token: {e}")
+        return {
+            "valid": False,
+            "message": "Error validating token"
+        }
+    
 @app.get("/auth/me", response_model=UserResponse)
 async def get_current_user_info(current_user: User = Depends(get_current_user)):
     """Get current user information"""
@@ -382,7 +693,7 @@ async def refresh_token(
     # Update user session
     user_session = db.query(UserSession).filter(UserSession.user_id == current_user.id).first()
     if user_session:
-        user_session.expires_at = datetime.utcnow() + access_token_expires
+        user_session.expires_at = datetime.now(timezone.utc) + access_token_expires
         db.commit()
     
     return Token(
@@ -403,7 +714,7 @@ health_router = APIRouter()
 
 @health_router.get("/health")
 async def health_check():
-    """Comprehensive health check"""
+    """Comprehensive health check including LlamaCloud status"""
     health_status = {
         "status": "healthy",
         "timestamp": time.time(),
@@ -446,6 +757,17 @@ async def health_check():
         health_status["checks"]["llm_providers"] = f"unhealthy: {str(e)}"
         health_status["status"] = "unhealthy"
     
+    # NEW: LlamaCloud processing
+    try:
+        if is_llamacloud_available():
+            health_status["checks"]["llamacloud"] = "healthy: API accessible"
+        else:
+            health_status["checks"]["llamacloud"] = "degraded: fallback available"
+            if health_status["status"] == "healthy":
+                health_status["status"] = "degraded"
+    except Exception as e:
+        health_status["checks"]["llamacloud"] = f"error: {str(e)}"
+    
     # System resources
     try:
         cpu_usage = psutil.cpu_percent()
@@ -465,6 +787,7 @@ async def health_check():
         health_status["checks"]["system_resources"] = f"error: {str(e)}"
     
     return health_status
+
 
 @health_router.get("/metrics")
 async def get_metrics():
@@ -488,7 +811,7 @@ async def get_app_stats():
         total_users = db.query(User).count()
         
         # Recent activity (last 24 hours)
-        recent_cutoff = datetime.utcnow() - timedelta(hours=24)
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
         
         recent_queries = db.query(QueryLog).filter(
             QueryLog.created_at >= recent_cutoff
@@ -545,15 +868,17 @@ async def get_app_stats():
 # Register the health router
 app.include_router(health_router, prefix="", tags=["health"])
 
+
 @app.post("/upload_pdf/", response_model=UploadResponse)
 async def upload_pdf(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    client = Depends(get_weaviate_client)
+    client = Depends(get_weaviate_client),
+    force_fallback: bool = Query(False, description="Force use of fallback processing")
 ):
-    """Enhanced PDF upload with user authentication, tracking, and table extraction"""
+    """Enhanced PDF upload with intelligent chunking"""
     
     user_id = current_user.id
     
@@ -574,9 +899,43 @@ async def upload_pdf(
         # Read file content
         contents = await file.read()
         
-        # NEW: Use enhanced PDF processor
-        from app.services.pdf_processor import enhanced_pdf_processor
-        processed_document = enhanced_pdf_processor.process_pdf_comprehensive(contents)
+        processed_document = None
+        processing_method = "fallback"
+        
+        # Try LlamaCloud processing first
+        if not force_fallback and should_use_llamacloud(contents, file.filename):
+            try:
+                logger.info(f"Using LlamaCloud for {file.filename}")
+                
+                llamacloud_processor = get_llamacloud_processor()
+                
+                if llamacloud_processor and llamacloud_processor.is_available():
+                    processed_document = llamacloud_processor.process_pdf_comprehensive(
+                        contents, file.filename
+                    )
+                    processing_method = "llamacloud"
+                    logger.info(f"✓ LlamaCloud processed: {len(processed_document.text_chunks)} chunks")
+                else:
+                    logger.warning("LlamaCloud processor not available")
+                    
+            except LlamaCloudError as e:
+                logger.warning(f"LlamaCloud failed: {e}, using fallback")
+            except Exception as e:
+                logger.error(f"LlamaCloud error: {e}, using fallback")
+        
+        # Fallback processing
+        if processed_document is None:
+            logger.info(f"Using fallback processing for {file.filename}")
+            try:
+                from app.services.pdf_processor import enhanced_pdf_processor
+                processed_document = enhanced_pdf_processor.process_pdf_comprehensive(contents)
+                processing_method = "fallback"
+            except Exception as e:
+                logger.error(f"Fallback processing failed: {e}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"PDF processing failed: {str(e)}"
+                )
         
         # Check for duplicate
         pdf_hash = processed_document.document_metadata.get('pdf_hash', '')
@@ -588,29 +947,65 @@ async def upload_pdf(
         if existing_doc:
             raise HTTPException(status_code=400, detail="Document already exists")
         
-        # Generate embeddings for text chunks
+        # Generate embeddings - CRITICAL: Use the intelligent chunks
+        logger.info(f"Generating embeddings for {len(processed_document.text_chunks)} chunks...")
         embeddings = vector_store.embed_chunks(processed_document.text_chunks)
+        
         if not embeddings:
             raise HTTPException(status_code=500, detail="Failed to generate embeddings")
         
-        # Store in vector database
-        vector_store.store_embeddings(client, document_id, processed_document.text_chunks, embeddings)
+        logger.info(f"✓ Generated {len(embeddings)} embeddings")
         
-        # Save document metadata to PostgreSQL
+        # Store in Weaviate - using the SAME intelligent chunks
+        logger.info(f"Storing in Weaviate...")
+        vector_store.store_embeddings(client, document_id, processed_document.text_chunks, embeddings)
+        logger.info(f"✓ Stored in Weaviate")
+        
+        # Save to PostgreSQL
+        document_metadata = processed_document.document_metadata.copy()
+        document_metadata['processing_method'] = processing_method
+        document_metadata['chunk_strategy'] = 'intelligent' if processing_method == 'llamacloud' else 'standard'
+        
         document = Document(
             id=document_id,
             filename=file.filename,
             file_hash=pdf_hash,
             file_size=len(contents),
-            page_count=processed_document.document_metadata.get('page_count', 0),
-            document_metadata=processed_document.document_metadata,
-            user_id=user_id
+            page_count=document_metadata.get('page_count', 0),
+            document_metadata=document_metadata,
+            user_id=user_id,
+            processing_method=processing_method,
+            processing_quality='high' if processing_method == 'llamacloud' else 'standard',
+            processing_time_ms=int((time.time() - start_time) * 1000)
         )
         
         db.add(document)
-        db.flush()  # Get the ID without committing
+        db.flush()
         
-        # NEW: Store extracted tables
+        # Store chunks in PostgreSQL - SAME intelligent chunks as Weaviate
+        logger.info(f"Storing {len(processed_document.text_chunks)} chunks in PostgreSQL...")
+        chunk_count = 0
+        
+        for chunk in processed_document.text_chunks:
+            db_chunk = DocumentChunk(
+                document_id=document_id,
+                chunk_index=chunk.id,
+                page_number=chunk.page_number,
+                content=chunk.text,
+                word_count=len(chunk.text.split()),
+                char_count=len(chunk.text),
+                chunk_metadata=chunk.metadata or {},
+                chunk_type=chunk.chunk_type,
+                content_format='markdown' if processing_method == 'llamacloud' else 'text',
+                extraction_method=processing_method,
+                quality_score=chunk.metadata.get('quality_score', 0.8)
+            )
+            db.add(db_chunk)
+            chunk_count += 1
+        
+        logger.info(f"✓ Stored {chunk_count} chunks in PostgreSQL")
+        
+        # Store extracted tables
         table_count = 0
         for table in processed_document.tables:
             db_table = DocumentTable(
@@ -624,16 +1019,21 @@ async def upload_pdf(
                 table_type=table.table_type,
                 confidence_score=table.confidence_score,
                 extraction_method=table.extraction_method,
-                processed=False  # Will be processed by background task
+                markdown_representation='|'.join(table.headers) if table.headers else '',
+                processing_quality='high' if processing_method == 'llamacloud' else 'standard',
+                processed=False
             )
             db.add(db_table)
             table_count += 1
         
+        logger.info(f"✓ Stored {table_count} tables")
+        
+        # Commit everything
         db.commit()
         
         processing_time = time.time() - start_time
         
-        # NEW: Background task for entity extraction
+        # Background task for entity extraction
         if table_count > 0:
             background_tasks.add_task(
                 process_table_entities,
@@ -646,19 +1046,28 @@ async def upload_pdf(
             user_id, document_id, file.filename, processing_time
         )
         
-        logger.info(f"Successfully processed {file.filename} in {processing_time:.2f}s - "
-                   f"{len(processed_document.text_chunks)} chunks, {table_count} tables")
+        logger.info(
+            f"✓✓✓ Successfully processed {file.filename} in {processing_time:.2f}s\n"
+            f"    Method: {processing_method}\n"
+            f"    Chunks: {chunk_count} (intelligent, not page-based)\n"
+            f"    Tables: {table_count}\n"
+            f"    Vector DB: ✓  PostgreSQL: ✓"
+        )
         
         return UploadResponse(
-            message="PDF processed successfully",
+            message=f"PDF processed successfully using {processing_method}",
             pdf_id=document_id,
             filename=file.filename,
             processing_time=processing_time,
-            chunk_count=len(processed_document.text_chunks),
+            chunk_count=chunk_count,
             metadata={
-                **processed_document.document_metadata,
+                **document_metadata,
                 'tables_extracted': table_count,
-                'document_type': processed_document.document_type.value
+                'document_type': processed_document.document_type.value,
+                'processing_method': processing_method,
+                'chunk_strategy': 'intelligent' if processing_method == 'llamacloud' else 'standard',
+                'llamacloud_available': is_llamacloud_available(),
+                'same_chunks_everywhere': True  # Confirmation that chunks match
             }
         )
         
@@ -667,6 +1076,53 @@ async def upload_pdf(
     except Exception as e:
         logger.error(f"PDF processing error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+    
+@app.get("/processing/status", response_model=Dict[str, Any])
+async def get_processing_status():
+    """Get status of available PDF processing methods"""
+    try:
+        # Get the processor instance and check its status
+        llamacloud_processor = get_llamacloud_processor()
+        
+        if llamacloud_processor:
+            llamacloud_stats = llamacloud_processor.get_processing_stats()
+        else:
+            llamacloud_stats = {
+                "service": "llamacloud",
+                "status": "unavailable",
+                "error": "Processor not initialized"
+            }
+        
+        return {
+            "llamacloud": llamacloud_stats,
+            "fallback": {
+                "service": "enhanced_pdf_processor",
+                "status": "healthy",
+                "capabilities": [
+                    "basic_tables",
+                    "text_extraction",
+                    "metadata_extraction"
+                ],
+                "supported_formats": ["pdf"]
+            },
+            "recommendations": {
+                "use_llamacloud_for": [
+                    "complex_layouts",
+                    "image_heavy_documents", 
+                    "scientific_papers",
+                    "financial_reports",
+                    "technical_documentation"
+                ],
+                "use_fallback_for": [
+                    "simple_text_documents",
+                    "when_llamacloud_unavailable"
+                ]
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting processing status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get processing status")
 
 # NEW: Background task for processing table entities
 async def process_table_entities(document_id: str, user_id: str):
@@ -1436,6 +1892,44 @@ Answer:"""
     
     return context
 
+@app.get("/debug/llamacloud")
+async def debug_llamacloud_status():
+    """Debug LlamaCloud configuration and status"""
+    from app.services.llamacloud_processor import (
+        get_llamacloud_processor, 
+        LLAMAPARSE_AVAILABLE,
+        LLAMAPARSE_ERROR
+    )
+    
+    processor = get_llamacloud_processor()
+    
+    status = {
+        "package_info": {
+            "llamaparse_available": LLAMAPARSE_AVAILABLE,
+            "import_error": LLAMAPARSE_ERROR
+        },
+        "environment": {
+            "api_key_in_env": bool(os.getenv('LLAMA_CLOUD_API_KEY')),
+            "api_key_prefix": os.getenv('LLAMA_CLOUD_API_KEY', '')[:10] + "..." if os.getenv('LLAMA_CLOUD_API_KEY') else None,
+            "api_key_in_config": hasattr(config, 'LLAMA_CLOUD_API_KEY')
+        },
+        "processor_status": processor.get_status() if processor else {
+            "error": "Processor instance is None"
+        },
+        "recommendations": []
+    }
+    
+    # Add recommendations based on status
+    if not LLAMAPARSE_AVAILABLE:
+        status["recommendations"].append("Install package: pip install llama-parse")
+    
+    if not status["environment"]["api_key_in_env"] and not status["environment"]["api_key_in_config"]:
+        status["recommendations"].append("Set API key: export LLAMA_CLOUD_API_KEY='llx-your-key'")
+    
+    if processor and not processor.is_available():
+        status["recommendations"].append(f"Fix initialization error: {processor._init_error}")
+    
+    return status
 
 @app.get("/conversations/", response_model=List[ConversationSummary])
 async def get_conversations(

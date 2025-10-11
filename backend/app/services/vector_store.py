@@ -3,8 +3,9 @@ import weaviate
 import weaviate.classes as wvc
 from weaviate.exceptions import WeaviateQueryException, WeaviateStartUpError
 from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
 from app.core import config
+from app.schemas import TextChunk  # Import the TextChunk dataclass
 import logging
 
 logger = logging.getLogger(__name__)
@@ -88,32 +89,81 @@ def create_schema_if_not_exists(client: weaviate.WeaviateClient):
     else:
         logger.info(f"Schema for class '{class_name}' already exists.")
 
-def embed_chunks(chunks_data: List[Dict[str, any]]) -> List[List[float]]:
+def embed_chunks(chunks_data: Union[List[Dict[str, any]], List[TextChunk]]) -> List[List[float]]:
+    """
+    Generate embeddings for text chunks.
+    
+    Args:
+        chunks_data: Either a list of dictionaries with 'text' key or a list of TextChunk objects
+    
+    Returns:
+        List of embedding vectors
+    """
     model = get_embedding_model()
-    texts_to_embed = [chunk['text'] for chunk in chunks_data]
+    
+    # Handle both dictionary and TextChunk object formats
+    texts_to_embed = []
+    for chunk in chunks_data:
+        if isinstance(chunk, TextChunk):
+            texts_to_embed.append(chunk.text)
+        elif isinstance(chunk, dict):
+            texts_to_embed.append(chunk['text'])
+        else:
+            logger.error(f"Unexpected chunk type: {type(chunk)}")
+            continue
+    
     if not texts_to_embed:
+        logger.warning("No text found to embed")
         return []
+    
+    logger.info(f"Embedding {len(texts_to_embed)} text chunks")
     embeddings = model.encode(texts_to_embed, convert_to_tensor=False).tolist()
     return embeddings
 
-def store_embeddings(client: weaviate.WeaviateClient, pdf_id: str, chunks_data: List[Dict[str, any]], embeddings: List[List[float]]):
+def store_embeddings(client: weaviate.WeaviateClient, pdf_id: str, chunks_data: Union[List[Dict[str, any]], List[TextChunk]], embeddings: List[List[float]]):
+    """
+    Store embeddings in Weaviate.
+    
+    Args:
+        client: Weaviate client
+        pdf_id: PDF identifier
+        chunks_data: Either a list of dictionaries or TextChunk objects
+        embeddings: List of embedding vectors
+    """
     class_name = config.WEAVIATE_CLASS_NAME
     collection = client.collections.get(class_name)
     
     data_objects = []
-    for i, chunk_dict in enumerate(chunks_data):
-        properties = {
-            "text": chunk_dict["text"],
-            "pdf_id": pdf_id,
-            "page_number": chunk_dict.get("page_number", 0)
-        }
-        vector = embeddings[i]
-        
-        if not isinstance(vector, list) or not all(isinstance(num, float) for num in vector):
-            logger.error(f"Invalid vector format for chunk {i}: {vector}")
+    for i, chunk in enumerate(chunks_data):
+        # Handle both dictionary and TextChunk object formats
+        if isinstance(chunk, TextChunk):
+            properties = {
+                "text": chunk.text,
+                "pdf_id": pdf_id,
+                "page_number": chunk.page_number
+            }
+        elif isinstance(chunk, dict):
+            properties = {
+                "text": chunk["text"],
+                "pdf_id": pdf_id,
+                "page_number": chunk.get("page_number", 0)
+            }
+        else:
+            logger.error(f"Unexpected chunk type at index {i}: {type(chunk)}")
             continue
-        
-        data_objects.append(wvc.data.DataObject(properties=properties, vector=vector))
+            
+        if i < len(embeddings):
+            vector = embeddings[i]
+            
+            if not isinstance(vector, list) or not all(isinstance(num, (int, float)) for num in vector):
+                logger.error(f"Invalid vector format for chunk {i}: {type(vector)}")
+                continue
+            
+            # Ensure all values are floats
+            vector = [float(v) for v in vector]
+            data_objects.append(wvc.data.DataObject(properties=properties, vector=vector))
+        else:
+            logger.error(f"No embedding found for chunk {i}")
 
     if data_objects:
         try:
@@ -126,8 +176,9 @@ def store_embeddings(client: weaviate.WeaviateClient, pdf_id: str, chunks_data: 
             logger.info(f"Stored {len(data_objects)} chunks for pdf_id: {pdf_id} in Weaviate using batch.")
         except Exception as e:
             logger.error(f"Error during batch import to Weaviate: {e}", exc_info=True)
+            raise
     else:
-        logger.info(f"No valid data objects to store for pdf_id: {pdf_id}")
+        logger.warning(f"No valid data objects to store for pdf_id: {pdf_id}")
 
 def semantic_search(client: weaviate.WeaviateClient, query_text: str, pdf_id: str, top_k: int = 3) -> List[Dict[str, Any]]:
     model = get_embedding_model()
