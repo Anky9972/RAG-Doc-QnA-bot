@@ -2079,6 +2079,75 @@ async def get_analytics_dashboard(
         logger.error(f"Error fetching analytics: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch analytics")
 
+
+@app.get("/analytics/trends")
+async def get_analytics_trends(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    days: int = Query(7, ge=1, le=90)
+):
+    """Get daily analytics trends for charts"""
+    try:
+        from datetime import timedelta
+        from sqlalchemy import func, cast, Date
+        
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+        
+        # Get daily query counts
+        daily_queries = db.query(
+            cast(QueryLog.created_at, Date).label('date'),
+            func.count(QueryLog.id).label('count')
+        ).filter(
+            QueryLog.user_id == current_user.id,
+            QueryLog.created_at >= cutoff_date
+        ).group_by(cast(QueryLog.created_at, Date)).all()
+        
+        # Get daily document uploads
+        daily_documents = db.query(
+            cast(Document.created_at, Date).label('date'),
+            func.count(Document.id).label('count')
+        ).filter(
+            Document.user_id == current_user.id,
+            Document.created_at >= cutoff_date
+        ).group_by(cast(Document.created_at, Date)).all()
+        
+        # Get daily costs
+        daily_costs = db.query(
+            cast(QueryLog.created_at, Date).label('date'),
+            func.sum(QueryLog.cost_cents).label('total_cost')
+        ).filter(
+            QueryLog.user_id == current_user.id,
+            QueryLog.created_at >= cutoff_date
+        ).group_by(cast(QueryLog.created_at, Date)).all()
+        
+        # Create a dictionary for easy lookup
+        queries_by_date = {str(q.date): q.count for q in daily_queries}
+        documents_by_date = {str(d.date): d.count for d in daily_documents}
+        costs_by_date = {str(c.date): (c.total_cost or 0) / 100 for c in daily_costs}  # Convert to dollars
+        
+        # Generate data for each day
+        trends = []
+        for i in range(days):
+            date = datetime.now(timezone.utc).date() - timedelta(days=days - i - 1)
+            date_str = str(date)
+            
+            trends.append({
+                "date": date_str,
+                "day": date.strftime("%b %d"),
+                "queries": queries_by_date.get(date_str, 0),
+                "documents": documents_by_date.get(date_str, 0),
+                "cost": float(costs_by_date.get(date_str, 0))
+            })
+        
+        return {
+            "trends": trends,
+            "period_days": days
+        }
+        
+    except Exception as e:
+        logger.error(f"Error fetching analytics trends: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch analytics trends")
+    
 @app.get("/providers/status", response_model=ProvidersStatus)
 async def get_providers_status():
     """Get status of all LLM providers"""
